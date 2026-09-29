@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# dsh-prompt-refine
-=======
 # dsh-prompt-refine
 
 [![CI](https://github.com/liyuhan7/dsh-prompt-refine/actions/workflows/ci.yml/badge.svg)](https://github.com/liyuhan7/dsh-prompt-refine/actions/workflows/ci.yml)
@@ -308,4 +305,3 @@ ready-to-load browser entry and never run a build step.
 ---
 
 Built for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). This is an independent community plugin.
->>>>>>> 3883dd4 (feat: dsh-prompt-refine v0.1.0 首个版本)
