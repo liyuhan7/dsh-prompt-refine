@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-refine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH Web Composer 提示词优化插件：发送前优化草稿或选中文字，采用 Prompt Engineering 技术进行优化",
   "private": true,
   "type": "module",
@@ -33,5 +33,5 @@
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-commands", "@deepseek-ai/dsh-client-ui-input-trigger"] }
   },
-  "dependencies": { "diff": "^9.0.0" }
+  "devDependencies": { "diff": "^9.0.0" }
 }

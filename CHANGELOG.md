@@ -3,6 +3,20 @@
 本插件的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 0.x 期间次要版本可能包含破坏性变更。
 
+## 0.1.1 — 更易安装
+
+### 变更
+
+- `diff` 从 `dependencies` 移到 `devDependencies`。运行时从未直接使用它：浏览器产物 `lib/client.bundle.js` 已内联 diff，host 半边不引用它，只有开发时的构建和测试需要。从此 **git 安装不再需要访问 npm registry**，网络受限环境（registry 超时、连接被重置）也能直接安装。
+
+### 升级说明
+
+无行为变化，已安装用户无需重新安装。从 GitHub 安装或升级仍用：
+
+```bash
+dsh plugin --profile desktop add github:liyuhan7/dsh-prompt-refine#v0.1.1
+```
+
 ## 0.1.0 — 首个版本
 
 首个可发布版本。功能范围是「发送前优化输入框内容」，不读取会话历史、附件或工作区文件。
