@@ -1,0 +1,4 @@
+# 挂载宿主插件，浏览器模块由 package.json 中的 dsh.client 声明加载。
+- insert:
+    - id: dsh-prompt-refine
+      name: dsh-prompt-refine

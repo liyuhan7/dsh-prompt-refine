@@ -1,0 +1,59 @@
+# ── 依赖 ────────────────────────────────────────────────
+node_modules/
+
+# ── 本机/内部资料，不上传 ───────────────────────────────
+# 开发指导与设计文档含本机路径和取证结论，仅本机保留。
+docs/internal/
+
+# 本机专用的 DSH profile 配置与验证产物
+.cordis/
+profiles/
+*.tgz
+
+# ── 构建缓存（发布产物见下方说明） ──────────────────────
+# 注意：lib/client.bundle.js 是发布产物本身，必须入库。
+# 浏览器半边由 dsh.client 直接从包内加载，安装时没有构建步骤。
+dist/
+build/
+*.tsbuildinfo
+
+# ── 日志 ────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── 缓存与覆盖率 ────────────────────────────────────────
+.cache/
+.npm/
+.npm-cache-tmp/
+.eslintcache
+coverage/
+.nyc_output/
+
+# ── 密钥与环境变量 ──────────────────────────────────────
+# 本插件不接受 API key（模型调用走宿主的 llm 服务），
+# 这些规则用于防止将来误提交。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets.json
+credentials.json
+.npmrc
+*.local
+
+# ── 编辑器 / 系统 ───────────────────────────────────────
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
