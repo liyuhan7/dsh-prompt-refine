@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-refine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH Web Composer 提示词优化插件：发送前优化草稿或选中文字，采用 Prompt Engineering 技术进行优化",
   "private": true,
   "type": "module",
