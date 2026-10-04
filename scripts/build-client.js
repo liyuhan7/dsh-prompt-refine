@@ -14,8 +14,11 @@ export function buildClientBundle() {
   const core = readFileSync(new URL('../lib/highlight-core.js', import.meta.url), 'utf8')
     .replace("import { diffArrays, diffChars } from 'diff'", 'const { diffArrays, diffChars } = diffLibrary')
     .replace(/^export /gm, '')
+  const session = readFileSync(new URL('../lib/refinement-session.js', import.meta.url), 'utf8')
+    .replace(/^export /gm, '')
   const client = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
     .replace("import * as diffEngine from './highlight-core.js'", '')
+    .replace("import { RefinementSession } from './refinement-session.js'", '')
   // 分发产物保留 jsdiff 的原始许可证声明。
   return `// 本文件由 npm run build 自动生成，请修改 client.js 或 highlight-core.js 后重新构建。
 /* jsdiff ${pkg.version} — BSD-3-Clause\n${license}*/
@@ -30,6 +33,7 @@ ${vendor}
 ${core}
     return { computeTextDiff, classifyDiffMagnitude, diffSegments, segmentsToHunks, diffHunks, diffRanges }
   })()
+${session}
 ${client}
 })()
 `

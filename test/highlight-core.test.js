@@ -294,6 +294,21 @@ test('check removes stale ranges on rev change and repeated clear is harmless', 
   assert.equal(core.status.kind, 'none')
 })
 
+test('check parses matching snapshot layout once and preserves stale revision cleanup', () => {
+  const core = make({ name: 'layout-check' })
+  const { root, highlights } = dom('new')
+  const current = snapshot('new', [], 2)
+  const show = () => core.show({ root, before: snapshot('old'), snapshot: current, original: 'old', result: 'new', start: 0 })
+  show()
+  let reads = 0
+  const checked = { ...current, get occurrences() { reads++; return [] } }
+  assert.equal(core.check({ root, snapshot: checked }).kind, 'highlighted')
+  assert.equal(reads, 2) // Array validation and iteration belong to one layout parse.
+  assert.equal(highlights.size, 1)
+  assert.equal(core.check({ root, snapshot: { ...current, draftRev: 3 } }).reason, 'draft-changed')
+  assert.equal(highlights.size, 0)
+})
+
 test('coalesceRanges folds adjacent additions into readable spans', () => {
   const core = make()
   const text = 'alpha：beta；gamma delta'
@@ -398,6 +413,32 @@ test('highlight styles retain the green palette and underline without a line bac
   core.clear()
   assert.equal(highlights.size, 0)
   assert.equal(doc.styles.every(style => style.removed), true)
+})
+
+test('current-model rendering needs no write snapshot and still validates DOM and scope', () => {
+  const core = make({ name: 'current', managed: true })
+  const { root, doc, highlights } = dom('a EDIT b')
+  assert.equal(core.show({ root, snapshot: snapshot('a EDIT b', [], 9),
+    original: 'a b', result: 'a EDIT b', start: 0, currentMode: true }).kind, 'highlighted')
+  assert.equal(highlights.size, 1)
+  assert.equal(doc.observer, undefined, 'session controller owns observation')
+  assert.equal(core.show({ root, snapshot: snapshot('a EDIT b', [], 9),
+    original: 'a b', result: 'wrong', start: 0, currentMode: true }).reason, 'draft-mismatch')
+  assert.equal(highlights.size, 0)
+  root.childNodes[0].childNodes[0].childNodes[0].data = 'stale DOM'
+  assert.equal(core.show({ root, snapshot: snapshot('a EDIT b', [], 9),
+    original: 'a b', result: 'a EDIT b', start: 0, currentMode: true }).reason, 'dom-mismatch')
+})
+
+test('current-model scope must not cover reference chips', () => {
+  const core = make({ managed: true })
+  const chip = occ(0)
+  const { root, highlights } = dom('@ref hi', [chip])
+  assert.equal(core.show({ root, snapshot: snapshot('@ref hi', [chip]),
+    original: 'hi', result: '@ref hi', start: 0, currentMode: true }).reason, 'draft-mismatch')
+  assert.equal(highlights.size, 0)
+  assert.equal(core.show({ root, snapshot: snapshot('@ref hi', [chip]),
+    original: 'hello', result: 'hi', start: 2, currentMode: true }).kind, 'highlighted')
 })
 
 test('coverage is measured against the whole draft, not the replaced text', () => {

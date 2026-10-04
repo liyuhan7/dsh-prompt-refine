@@ -350,8 +350,10 @@ function deferredSse() {
 }
 
 /** 通过公开按钮启动，渲染真实注册的操作浮层。 */
-function sseHarness({ withEditor = false, autostart = true } = {}) {
+function sseHarness({ withEditor = false, withEditorEvents = false, whole = false, autostart = true,
+  confirm = () => true } = {}) {
   const streams = []
+  const confirmations = []
   const shell = fakeShell({ occurrences: [], attachmentIds: [] })
   const listeners = new Set()
   shell.state.subscribe = fn => { listeners.add(fn); return () => listeners.delete(fn) }
@@ -370,7 +372,7 @@ function sseHarness({ withEditor = false, autostart = true } = {}) {
   if (withEditor) {
     // 宿主快照不可变，DOM 和事务测试应读取独立的时点副本。
     shell.state.getSnapshot = () => JSON.parse(JSON.stringify(shell.snap))
-    const text = { nodeType: 3, data: shell.snap.draft }
+    let text = { nodeType: 3, data: shell.snap.draft }
     const span = { nodeType: 1, tagName: 'SPAN', childNodes: [text], getAttribute: () => null }
     const paragraph = { nodeType: 1, tagName: 'P', childNodes: [span] }
     const highlights = new Map()
@@ -380,20 +382,52 @@ function sseHarness({ withEditor = false, autostart = true } = {}) {
       createElement: () => ({ remove() { this.removed = true }, textContent: '' }),
       head: { appendChild: style => { doc.styles.push(style) } },
       defaultView: { CSS: { highlights }, Highlight: class { constructor(...ranges) { this.ranges = ranges } },
+        confirm: () => { throw Error('native confirm must never be invoked') },
         MutationObserver: class { constructor(callback) { this.callback = callback; doc.observer = this } observe() {} disconnect() {} notify() { this.callback() } } }
     }
-    const root = { nodeType: 1, tagName: 'DIV', childNodes: [paragraph], ownerDocument: doc,
+    let root = { nodeType: 1, tagName: 'DIV', childNodes: [paragraph], ownerDocument: doc,
       getAttribute: key => key === 'data-composer-input' ? '' : null }
-    shell.editor = { getRootElement: () => root }
+    const eventsFor = node => {
+      const eventListeners = new Map()
+      if (withEditorEvents) {
+        node.addEventListener = (name, callback) => {
+          if (!eventListeners.has(name)) eventListeners.set(name, new Set())
+          eventListeners.get(name).add(callback)
+        }
+        node.removeEventListener = (name, callback) => eventListeners.get(name)?.delete(callback)
+      }
+      const dispatch = name => { for (const callback of [...(eventListeners.get(name) ?? [])]) callback() }
+      return { eventListeners, dispatch }
+    }
+    const initialEvents = eventsFor(root)
+    const rootListeners = new Set()
+    shell.editor = {
+      getRootElement: () => root,
+      registerRootListener: callback => {
+        rootListeners.add(callback)
+        callback(root, null)
+        return () => rootListeners.delete(callback)
+      }
+    }
+    const replaceRoot = () => {
+      const previous = { root, text, eventListeners: dom.eventListeners, dispatch: dom.dispatch }
+      text = { nodeType: 3, data: shell.snap.draft }
+      root = { nodeType: 1, tagName: 'DIV', ownerDocument: doc,
+        childNodes: [{ nodeType: 1, tagName: 'P', childNodes: [{ nodeType: 1, tagName: 'SPAN', childNodes: [text], getAttribute: () => null }] }],
+        getAttribute: key => key === 'data-composer-input' ? '' : null }
+      Object.assign(dom, { root, text }, eventsFor(root))
+      for (const callback of [...rootListeners]) callback(root, previous.root)
+      return previous
+    }
     const insert = shell.actions.insertText
     shell.actions.insertText = (value, range) => {
       const applied = insert(value, range)
       if (applied) { text.data = shell.snap.draft; publish() }
       return applied
     }
-    dom = { root, text, highlights, doc }
+    dom = { root, text, highlights, doc, ...initialEvents, rootListeners, replaceRoot }
   }
-  shell.actions.captureInsertion = () => ({ start: 4, end: 7, draftRev: shell.snap.draftRev })
+  shell.actions.captureInsertion = () => ({ start: whole ? 0 : 4, end: whole ? 0 : 7, draftRev: shell.snap.draftRev })
   shell.notify = (_level, message) => { throw Error(`unexpected notification: ${message}`) }
   const layoutEffects = []
   const React = {
@@ -434,10 +468,35 @@ function sseHarness({ withEditor = false, autostart = true } = {}) {
       if (node.type === 'button' && node.children[0] === label) return node
       return descend(node.children)
     }
-    return descend(overlay())
+    const node = descend(overlay())
+    if (!node) return null
+    return { ...node, props: { ...node.props, onClick: (...args) => {
+      const result = node.props.onClick(...args)
+      // 真正的操作先同步建立确认状态，再模拟用户点击内联确认按钮。
+      const prompt = confirmation()
+      if (confirm && prompt) {
+        const message = textOf(prompt).replace(/确认覆盖取消$/, '')
+        confirmations.push(message)
+        const accepted = confirm(message)
+        // 回调可能关闭面板；不能使用关闭之前捕获的确认按钮。
+        if (confirmation() === null) return result
+        const answer = descendButton(overlay(), accepted ? '确认覆盖' : '取消')
+        answer?.props.onClick()
+      }
+      return result
+    } } }
+  }
+  const confirmation = () => {
+    const find = node => {
+      if (!node || typeof node !== 'object') return null
+      if (Array.isArray(node)) return node.map(find).find(Boolean) ?? null
+      if (node.props?.role === 'alert' && descendButton(node, '确认覆盖')) return node
+      return find(node.children)
+    }
+    return find(overlay())
   }
   if (autostart) slots.get('conversation.input.right').component({ sessionId: 'session-1', refineContext: ctx }).props.onClick()
-  return { shell, streams, overlay, button, publish, dom, listeners, session, sessionListeners, publishSession,
+  return { shell, streams, overlay, button, confirmation, publish, dom, listeners, session, sessionListeners, publishSession, confirmations,
     status: () => overlay().children[1].children[0],
     right: () => slots.get('conversation.input.right').component({ sessionId: 'session-1', refineContext: ctx }),
     mount: () => { layoutEffects.length = 0; overlay(); return layoutEffects.at(-1)?.() },
@@ -447,6 +506,22 @@ const sse = (name, data) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`
 const flushSse = () => new Promise(resolve => setImmediate(resolve))
 /** 等待浮层的延迟卸载清理执行。 */
 const tick = () => new Promise(resolve => setTimeout(resolve, 5))
+/** 留出 200ms 差异防抖的执行窗口。 */
+const settleDiff = () => new Promise(resolve => setTimeout(resolve, 230))
+const originalDraft = 'AAA BBB CCC'
+const manualEdit = (h, draft, { notify = true } = {}) => {
+  h.shell.snap.draftRev += Number(h.shell.snap.draft !== draft)
+  h.shell.snap.draft = draft
+  if (h.dom) h.dom.text.data = draft
+  if (notify) h.publish()
+}
+const finishGeneration = async (h, text, index = h.streams.length - 1) => {
+  h.streams[index].event('done', { text })
+  h.streams[index].end()
+  await flushSse()
+}
+const highlightedRanges = h => [...h.dom.highlights.values()].flatMap(highlight => highlight.ranges)
+const selectionError = '无法可靠追踪当前优化范围，已停止写入；请完成后重新开始。'
 
 test('SSE deltas and a failed stream never write partial text to the composer', async () => {
   const h = sseHarness()
@@ -536,6 +611,12 @@ test('button backgrounds live in the stylesheet so hover can win', async () => {
   assert.equal(descendButton(h.overlay(), '完成').props.style.color, '#fff')
 })
 
+function textOf(node) {
+  if (typeof node === 'string') return node
+  if (!node || typeof node !== 'object') return ''
+  return (Array.isArray(node) ? node : node.children ?? []).map(textOf).join('')
+}
+
 function descendButton(root, label) {
   if (!root || typeof root !== 'object') return null
   if (Array.isArray(root)) return root.map(child => descendButton(child, label)).find(Boolean) ?? null
@@ -593,8 +674,8 @@ test('browser entry highlights only the rewritten text after its single confirme
   assert.deepEqual(h.status().children[0].children, ['已优化'])
   assert.equal(h.status().children[0].props.style.background, '#E7F4EC')
   assert.equal(h.status().children[0].props.style.color, '#167044')
-  assert.deepEqual(h.status().children[1].children, ['改动已标出'])
-  assert.equal(h.status().children[1].props.style.fontSize, 13)
+  assert.equal(h.status().children.length, 1)
+  assert.equal(h.status().props.title, '已优化 · 改动已标出')
   h.button('完成').props.onClick()
   assert.equal(h.dom.highlights.size, 0)
   assert.equal(h.listeners.size, 0)
@@ -632,9 +713,9 @@ test('each regeneration submits the original prompt and the latest note without 
   for (const [index, note, result] of [[1, '重点测试异常路径', 'second result'], [2, '更简洁', 'third result']]) {
     noteInput().props.onChange({ target: { value: note } })
     h.button('重新生成').props.onClick()
+    await flushSse()
     assert.equal(h.status().props['aria-label'], '正在优化草稿…')
     assert.ok(h.button('停止生成'))
-    await flushSse()
     assert.equal(h.streams.length, index + 1)
     assert.deepEqual(request(index), { sessionId: 'session-1', text: 'BBB', note })
     h.streams[index].event('done', { text: result })
@@ -677,7 +758,7 @@ test('an identical regenerated result reports completion rather than silently sh
   assert.equal(h.shell.snap.draft, 'AAA BBB CCC')
 })
 
-test('regeneration replaces its prior result and clears the old highlight before new done', async () => {
+test('regeneration replaces its prior result and preserves the old highlight before new done', async () => {
   const h = sseHarness({ withEditor: true })
   await flushSse()
   h.streams[0].event('done', { text: 'BETTER' })
@@ -685,7 +766,7 @@ test('regeneration replaces its prior result and clears the old highlight before
   await flushSse()
   assert.equal(h.dom.highlights.size, 1)
   h.button('重新生成').props.onClick()
-  assert.equal(h.dom.highlights.size, 0)
+  assert.equal(h.dom.highlights.size, 1)
   await flushSse()
   h.streams[1].event('done', { text: 'BEST' })
   h.streams[1].end()
@@ -699,7 +780,7 @@ test('regeneration replaces its prior result and clears the old highlight before
   assert.equal(h.listeners.size, 0)
 })
 
-test('failed regeneration leaves the successful draft but never claims cleared highlights', async () => {
+test('failed regeneration preserves the successful draft and its highlights', async () => {
   const h = sseHarness({ withEditor: true })
   await flushSse()
   h.streams[0].event('done', { text: 'BETTER' })
@@ -707,13 +788,14 @@ test('failed regeneration leaves the successful draft but never claims cleared h
   await flushSse()
   assert.equal(h.dom.highlights.size, 1)
   h.button('重新生成').props.onClick()
-  assert.equal(h.dom.highlights.size, 0)
+  assert.equal(h.dom.highlights.size, 1)
   await flushSse()
   h.streams[1].event('failure', { error: 'temporarily unavailable' })
   h.streams[1].end()
   await flushSse()
   assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
-  assert.equal(h.status().props['aria-label'], '已优化')
+  assert.equal(h.dom.highlights.size, 1)
+  assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
   h.button('完成').props.onClick()
 })
 
@@ -755,7 +837,7 @@ test('an immediate remount reuses the panel instead of tearing down a live reque
   assert.equal(h.dom.highlights.size, 0)
 })
 
-test('DOM-only mutation clears live highlight and updates the operation strip', async () => {
+test('DOM-only mutation temporarily clears live highlight then restores it', async () => {
   const h = sseHarness({ withEditor: true })
   await flushSse()
   h.streams[0].event('done', { text: 'BETTER' })
@@ -765,6 +847,9 @@ test('DOM-only mutation clears live highlight and updates the operation strip', 
   h.dom.doc.observer.notify()
   assert.equal(h.dom.highlights.size, 0)
   assert.equal(h.status().props['aria-label'], '已优化')
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 1)
+  assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
   h.dispose()
   assert.equal(h.listeners.size, 0)
 })
@@ -918,7 +1003,556 @@ test('submission aborts an in-flight generation and late events cannot write or 
   assert.equal(h.overlay(), null)
 })
 
-test('manual edit immediately aborts generation, removes highlights and disables unsafe undo', async () => {
+test('whole manual editing refreshes differences against the original without writing the composer', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
+  const writes = h.shell.calls.length
+  manualEdit(h, 'AAA BBB DDD')
+  assert.equal(h.dom.highlights.size, 0)
+  assert.equal(h.status().props['aria-label'], '正在编辑 · 差异实时更新')
+  assert.equal(h.button('撤销优化').props.disabled, false)
+  assert.equal(h.button('重新生成').props.disabled, false)
+  await settleDiff()
+  // BETTER 被手动恢复成 BBB 后不再高亮；只比较最初的 CCC 和当前的 DDD。
+  assert.deepEqual(highlightedRanges(h).map(range => [range.start[1], range.end[1]]), [[8, 11]])
+  assert.equal(h.shell.calls.length, writes)
+  h.button('原文').props.onClick()
+  const original = h.overlay().children.find(node => node?.type === 'textarea')
+  assert.equal(original.props.value, originalDraft)
+})
+
+test('whole editing back to the original clears every difference and keeps the review usable', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  assert.equal(h.dom.highlights.size, 1)
+  manualEdit(h, originalDraft)
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 0)
+  assert.equal(h.shell.snap.draft, originalDraft)
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.button('撤销优化').props.disabled, false)
+  assert.equal(h.button('重新生成').props.disabled, false)
+  assert.ok(h.overlay())
+})
+
+test('whole DOM-only remapping rebuilds highlight ranges on the replacement text node', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  const oldText = h.dom.text
+  const replacement = { nodeType: 3, data: oldText.data }
+  h.dom.root.childNodes[0].childNodes[0].childNodes = [replacement]
+  h.dom.doc.observer.notify()
+  assert.equal(h.dom.highlights.size, 0)
+  await settleDiff()
+  const ranges = highlightedRanges(h)
+  assert.equal(ranges.length, 1)
+  assert.equal(ranges[0].start[0], replacement)
+  assert.equal(ranges[0].end[0], replacement)
+  assert.deepEqual([ranges[0].start[1], ranges[0].end[1]], [5, 10])
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.confirmations.length, 0)
+  assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
+})
+
+test('IME composition defers whole-draft diff painting until composition ends', async t => {
+  const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  assert.equal(h.dom.eventListeners.get('compositionstart').size, 1)
+  h.dom.dispatch('compositionstart')
+  assert.equal(h.dom.highlights.size, 0)
+  manualEdit(h, 'AAA BBB 输入中')
+  h.dom.doc.observer.notify()
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 0)
+  manualEdit(h, 'AAA BBB 完成')
+  h.dom.dispatch('compositionend')
+  await settleDiff()
+  assert.ok(h.dom.highlights.size > 0)
+  assert.equal(h.shell.snap.draft, 'AAA BBB 完成')
+  assert.equal(h.shell.calls.length, 1)
+  h.dispose()
+  assert.equal(h.dom.eventListeners.get('compositionstart').size, 0)
+  assert.equal(h.dom.eventListeners.get('compositionend').size, 0)
+})
+
+test('disposal cancels a launch waiting for Enter adjudication and prevents delayed reopening', async t => {
+  const h = sseHarness({ withEditor: true, whole: true, autostart: false })
+  t.after(() => h.dispose())
+  h.shell.snap.phase = 'adjudicating'
+  h.right().props.onClick()
+  assert.equal(h.overlay(), null)
+  assert.equal(h.streams.length, 0)
+  h.dispose()
+  h.shell.snap.phase = 'plain'
+  h.publish()
+  await settleDiff()
+  assert.equal(h.overlay(), null)
+  assert.equal(h.streams.length, 0)
+  assert.equal(h.shell.calls.length, 0)
+  assert.equal(h.listeners.size, 0)
+  assert.equal(h.dom.rootListeners.size, 0)
+  h.right().props.onClick()
+  await flushSse()
+  assert.equal(h.overlay(), null)
+  assert.equal(h.streams.length, 0)
+})
+
+test('root replacement during composition restores highlights without a draft notification', async t => {
+  const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  h.dom.dispatch('compositionstart')
+  assert.equal(h.dom.highlights.size, 0)
+  const previous = h.dom.replaceRoot()
+  assert.equal(previous.eventListeners.get('compositionstart').size, 0)
+  assert.equal(previous.eventListeners.get('compositionend').size, 0)
+  assert.equal(h.dom.eventListeners.get('compositionstart').size, 1)
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 1)
+  assert.equal(highlightedRanges(h)[0].start[0], h.dom.text)
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
+  // 新根已经绑定 IME 监听，而旧根的迟到事件不再影响面板。
+  previous.dispatch('compositionstart')
+  assert.equal(h.dom.highlights.size, 1)
+  h.dom.dispatch('compositionstart')
+  assert.equal(h.dom.highlights.size, 0)
+  h.dom.dispatch('compositionend')
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 1)
+  h.dispose()
+  assert.equal(h.dom.rootListeners.size, 0)
+  assert.equal(h.dom.eventListeners.get('compositionstart').size, 0)
+  assert.equal(h.dom.eventListeners.get('compositionend').size, 0)
+})
+
+test('composition start aborts a pending request before draft publication and refuses late writes', async t => {
+  const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  const staleRegenerate = h.button('重新生成').props.onClick
+  staleRegenerate()
+  await flushSse()
+  assert.equal(h.streams.length, 2)
+  h.dom.dispatch('compositionstart')
+  assert.equal(h.streams[1].options.signal.aborted, true)
+  assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
+  staleRegenerate()
+  h.button('撤销优化').props.onClick()
+  await finishGeneration(h, 'obsolete request must not commit', 1)
+  assert.equal(h.streams.length, 2)
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
+  assert.equal(h.dom.highlights.size, 0)
+  h.dom.dispatch('compositionend')
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 1)
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  assert.equal(h.streams.length, 3)
+  await finishGeneration(h, 'AAA BEST CCC')
+  assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
+})
+
+test('closing the panel during confirmation prevents zombie undo and regeneration despite unchanged draft', async t => {
+  for (const action of ['撤销优化', '重新生成']) {
+    let h
+    h = sseHarness({ withEditor: true, whole: true, confirm: () => { h.dispose(); return true } })
+    t.after(() => h.dispose())
+    await flushSse()
+    await finishGeneration(h, 'AAA BETTER CCC')
+    manualEdit(h, 'dirty edit preserved after closing', { notify: false })
+    const revision = h.shell.snap.draftRev
+    h.button(action).props.onClick()
+    await flushSse()
+    assert.equal(h.confirmations.length, 1)
+    assert.equal(h.shell.snap.draft, 'dirty edit preserved after closing')
+    assert.equal(h.shell.snap.draftRev, revision)
+    assert.equal(h.shell.calls.length, 1)
+    assert.equal(h.streams.length, 1)
+    assert.equal(h.overlay(), null)
+    assert.equal(h.listeners.size, 0)
+    assert.equal(h.sessionListeners.size, 0)
+    assert.equal(h.dom.rootListeners.size, 0)
+    await settleDiff()
+    assert.equal(h.overlay(), null)
+  }
+})
+
+test('rapid regeneration through a stale click handler aborts the superseded request', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  const regenerate = h.button('重新生成').props.onClick
+  regenerate()
+  regenerate()
+  await flushSse()
+  assert.equal(h.streams.length, 3)
+  assert.equal(h.streams[1].options.signal.aborted, true)
+  assert.equal(h.streams[2].options.signal.aborted, false)
+  assert.equal(h.dom.highlights.size, 1)
+  await finishGeneration(h, 'obsolete duplicate result', 1)
+  assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
+  assert.equal(h.shell.calls.length, 1)
+  await finishGeneration(h, 'AAA BEST CCC', 2)
+  assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
+  assert.equal(h.shell.calls.length, 2)
+})
+
+test('selection metadata-only changes invalidate the owned range without altering text', async t => {
+  for (const change of [
+    snapshot => { snapshot.draftRev++ },
+    snapshot => { snapshot.attachmentIds.push('new-attachment') },
+    snapshot => { snapshot.phase = 'claimed' }
+  ]) {
+    const h = sseHarness({ withEditor: true })
+    t.after(() => h.dispose())
+    await flushSse()
+    await finishGeneration(h, 'BETTER')
+    const draft = h.shell.snap.draft
+    change(h.shell.snap)
+    h.publish()
+    assert.equal(h.shell.snap.draft, draft)
+    assert.equal(h.dom.highlights.size, 0)
+    assert.equal(h.button('撤销优化').props.disabled, true)
+    assert.equal(h.button('重新生成').props.disabled, true)
+    assert.deepEqual(h.overlay().children.find(node => node?.props?.role === 'alert').children, [selectionError])
+    h.button('撤销优化').props.onClick()
+    h.button('重新生成').props.onClick()
+    await flushSse()
+    assert.equal(h.shell.calls.length, 1)
+    assert.equal(h.streams.length, 1)
+  }
+})
+
+test('status renders only its badge and confirmation actions align to the right', async t => {
+  const h = sseHarness({ withEditor: true, whole: true, confirm: null })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  manualEdit(h, 'manual changes')
+  const status = h.status()
+  assert.equal(status.children.length, 1)
+  assert.equal(status.children[0].children[0], '正在编辑')
+  assert.equal(status.props.title, '正在编辑 · 差异实时更新')
+  h.button('撤销优化').props.onClick()
+  const find = node => {
+    if (!node || typeof node !== 'object') return null
+    if (Array.isArray(node)) return node.map(find).find(Boolean)
+    if (node.props?.role === 'alert' && node.children?.[0]?.children?.[0]?.includes('撤销会覆盖')) return node
+    return find(node.children)
+  }
+  const alert = find(h.overlay())
+  assert.ok(alert)
+  assert.equal(alert.children[0].props.style.flex, '1 1 auto')
+  assert.equal(alert.children[1].props.style.marginLeft, 'auto')
+  assert.equal(alert.children[1].props.style.flex, '0 0 auto')
+  assert.deepEqual(alert.children[1].children.map(node => node.children[0]), ['确认覆盖', '取消'])
+  h.button('取消').props.onClick()
+  assert.equal(h.shell.snap.draft, 'manual changes')
+})
+
+test('undo insertion failure reports its original error and preserves the editable session', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  manualEdit(h, 'manual changes')
+  h.shell.actions.insertText = () => { throw Error('host insertion failed') }
+  assert.doesNotThrow(() => h.button('撤销优化').props.onClick())
+  assert.equal(h.shell.snap.draft, 'manual changes')
+  assert.match(JSON.stringify(h.overlay()), /host insertion failed/)
+  manualEdit(h, 'manual changes after failed undo')
+  await settleDiff()
+  assert.match(JSON.stringify(h.status()), /正在编辑/)
+  assert.equal(h.shell.snap.draft, 'manual changes after failed undo')
+  h.button('完成').props.onClick()
+  assert.equal(h.overlay(), null)
+  assert.equal(h.listeners.size, 0)
+})
+
+test('dirty whole undo asks before overwriting, including input not yet published', async t => {
+  for (const notify of [true, false]) {
+    let accepted = false
+    const h = sseHarness({ withEditor: true, whole: true, confirm: () => accepted })
+    t.after(() => h.dispose())
+    await flushSse()
+    await finishGeneration(h, 'AAA BETTER CCC')
+    manualEdit(h, 'my unpublished changes', { notify })
+    h.button('撤销优化').props.onClick()
+    assert.equal(h.confirmations.length, 1)
+    assert.match(h.confirmations[0], /撤销会覆盖你的修改/)
+    assert.equal(h.shell.snap.draft, 'my unpublished changes')
+    assert.equal(h.shell.calls.length, 1)
+    assert.ok(h.overlay())
+    accepted = true
+    h.button('撤销优化').props.onClick()
+    assert.equal(h.confirmations.length, 2)
+    assert.equal(h.shell.snap.draft, originalDraft)
+    assert.equal(h.shell.calls.length, 2)
+    assert.equal(h.overlay(), null)
+    assert.equal(h.dom.highlights.size, 0)
+    assert.equal(h.listeners.size, 0)
+    assert.equal(h.sessionListeners.size, 0)
+  }
+})
+
+test('inline confirmation manually cancels and accepts dirty undo and regeneration without native confirm', async t => {
+  for (const action of ['撤销优化', '重新生成']) {
+    const h = sseHarness({ withEditor: true, whole: true, confirm: null })
+    t.after(() => h.dispose())
+    await flushSse()
+    await finishGeneration(h, 'AAA BETTER CCC')
+    manualEdit(h, 'unpublished dirty edit', { notify: false })
+    h.button(action).props.onClick()
+    assert.ok(h.confirmation())
+    assert.match(textOf(h.confirmation()), action === '撤销优化' ? /撤销会覆盖你的修改/ : /重新生成会覆盖你的修改/)
+    assert.equal(h.shell.snap.draft, 'unpublished dirty edit')
+    assert.equal(h.streams.length, 1)
+    h.button('取消').props.onClick()
+    await flushSse()
+    assert.equal(h.confirmation(), null)
+    assert.equal(h.shell.calls.length, 1)
+    assert.equal(h.streams.length, 1)
+    assert.equal(h.shell.snap.draft, 'unpublished dirty edit')
+    h.button(action).props.onClick()
+    assert.ok(h.confirmation())
+    h.button('确认覆盖').props.onClick()
+    await flushSse()
+    assert.equal(h.confirmation(), null)
+    if (action === '撤销优化') {
+      assert.equal(h.shell.snap.draft, originalDraft)
+      assert.equal(h.overlay(), null)
+      assert.equal(h.shell.calls.length, 2)
+    } else {
+      assert.equal(h.streams.length, 2)
+      assert.equal(h.shell.snap.draft, 'unpublished dirty edit')
+      await finishGeneration(h, 'AAA BEST CCC')
+      assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
+      assert.equal(h.shell.calls.length, 2)
+    }
+    assert.equal(h.confirmations.length, 0)
+  }
+})
+
+test('repeated manual confirmation cycles close cleanly and leave later host edits alone', async t => {
+  const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true, confirm: null, autostart: false })
+  t.after(() => h.dispose())
+  for (let cycle = 0; cycle < 3; cycle++) {
+    h.right().props.onClick()
+    await flushSse()
+    await finishGeneration(h, `generated ${cycle}`)
+    manualEdit(h, `dirty ${cycle}`)
+    for (const action of ['重新生成', '撤销优化']) {
+      h.button(action).props.onClick()
+      assert.ok(h.confirmation())
+      h.button('取消').props.onClick()
+      await flushSse()
+      assert.equal(h.confirmation(), null)
+      assert.equal(h.shell.snap.draft, `dirty ${cycle}`)
+    }
+    h.button('重新生成').props.onClick()
+    h.button('确认覆盖').props.onClick()
+    await flushSse()
+    await finishGeneration(h, `regenerated ${cycle}`)
+    manualEdit(h, `dirty undo ${cycle}`)
+    h.button('撤销优化').props.onClick()
+    h.button('确认覆盖').props.onClick()
+    assert.equal(h.shell.snap.draft, originalDraft)
+    assert.equal(h.overlay(), null)
+    assert.equal(h.listeners.size, 0)
+    assert.equal(h.sessionListeners.size, 0)
+    assert.equal(h.dom.rootListeners.size, 0)
+    for (const listeners of h.dom.eventListeners.values()) assert.equal(listeners.size, 0)
+    assert.equal(h.dom.highlights.size, 0)
+    const writes = h.shell.calls.length
+    manualEdit(h, `host edit after close ${cycle}`)
+    h.dom.dispatch('compositionstart')
+    h.dom.dispatch('compositionend')
+    h.dom.doc.observer.notify()
+    await settleDiff()
+    assert.equal(h.shell.snap.draft, `host edit after close ${cycle}`)
+    assert.equal(h.shell.calls.length, writes)
+    assert.equal(h.overlay(), null)
+    manualEdit(h, originalDraft)
+  }
+})
+
+test('finish, submission and unmount cancel pending inline actions without stale writes', async t => {
+  for (const action of ['撤销优化', '重新生成']) {
+    for (const close of ['finish', 'submission', 'phase', 'unmount']) {
+      const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true, confirm: null })
+      t.after(() => h.dispose())
+      const unmount = h.mount()
+      await flushSse()
+      await finishGeneration(h, 'AAA BETTER CCC')
+      manualEdit(h, `dirty before ${close}`)
+      h.button(action).props.onClick()
+      const staleAccept = h.button('确认覆盖').props.onClick
+      const staleCancel = h.button('取消').props.onClick
+      assert.ok(h.confirmation())
+      if (close === 'finish') h.button('完成').props.onClick()
+      else if (close === 'submission') h.publishSession({ pendingSubmissions: [{ requestId: `send-${action}`, placement: 'transcript' }] })
+      else if (close === 'phase') { h.shell.snap.phase = 'submitting'; h.publish() }
+      else { unmount(); await tick() }
+      await flushSse()
+      assert.equal(h.overlay(), null)
+      assert.equal(h.streams.length, 1)
+      assert.equal(h.shell.calls.length, 1)
+      assert.equal(h.shell.snap.draft, `dirty before ${close}`)
+      assert.equal(h.listeners.size, 0)
+      assert.equal(h.sessionListeners.size, 0)
+      assert.equal(h.dom.rootListeners.size, 0)
+      for (const listeners of h.dom.eventListeners.values()) assert.equal(listeners.size, 0)
+      manualEdit(h, `host edit after ${close}`)
+      staleAccept()
+      staleCancel()
+      await flushSse()
+      assert.equal(h.shell.snap.draft, `host edit after ${close}`)
+      assert.equal(h.shell.calls.length, 1)
+      assert.equal(h.streams.length, 1)
+      assert.equal(h.overlay(), null)
+    }
+  }
+})
+
+test('dirty undo and regeneration reject a revision changed during confirmation', async t => {
+  for (const action of ['撤销优化', '重新生成']) {
+    let h
+    h = sseHarness({ withEditor: true, whole: true, confirm: () => {
+      manualEdit(h, 'newer edit while confirming', { notify: false })
+      return true
+    } })
+    t.after(() => h.dispose())
+    await flushSse()
+    await finishGeneration(h, 'AAA BETTER CCC')
+    manualEdit(h, 'dirty before confirmation', { notify: false })
+    h.button(action).props.onClick()
+    await flushSse()
+    assert.equal(h.confirmations.length, 1)
+    assert.equal(h.shell.snap.draft, 'newer edit while confirming')
+    assert.equal(h.shell.calls.length, 1)
+    assert.equal(h.streams.length, 1)
+    assert.ok(h.overlay())
+    assert.equal(h.button('重新生成').props.disabled, false)
+  }
+})
+
+test('dirty whole regeneration confirms and sends original plus note, never the edited draft', async t => {
+  let accepted = false
+  const h = sseHarness({ withEditor: true, whole: true, confirm: () => accepted })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  h.button('补充要求').props.onClick()
+  h.overlay().children.find(node => node?.props?.['aria-label'] === '本次补充要求').props.onChange({ target: { value: '保留细节，更简洁' } })
+  manualEdit(h, 'edited draft not yet published', { notify: false })
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  assert.equal(h.confirmations.length, 1)
+  assert.match(h.confirmations[0], /重新生成会覆盖你的修改/)
+  assert.equal(h.streams.length, 1)
+  assert.equal(h.shell.snap.draft, 'edited draft not yet published')
+  accepted = true
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  assert.equal(h.confirmations.length, 2)
+  assert.equal(h.streams.length, 2)
+  assert.deepEqual(JSON.parse(h.streams[1].options.body), { sessionId: 'session-1', text: originalDraft, note: '保留细节，更简洁' })
+  assert.equal(h.shell.snap.draft, 'edited draft not yet published')
+  await finishGeneration(h, 'AAA BEST CCC')
+  assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
+  assert.equal(h.shell.calls.length, 2)
+  assert.doesNotMatch(h.status().props['aria-label'], /正在编辑/)
+  h.button('撤销优化').props.onClick()
+  assert.equal(h.confirmations.length, 2)
+  assert.equal(h.shell.snap.draft, originalDraft)
+})
+
+test('manual edit aborts whole regeneration but leaves the session editable and reusable', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  manualEdit(h, 'AAA BBB manually revised')
+  assert.equal(h.streams[1].options.signal.aborted, true)
+  assert.equal(h.button('撤销优化').props.disabled, false)
+  assert.equal(h.button('重新生成').props.disabled, false)
+  assert.equal(h.status().props['aria-label'], '正在编辑 · 差异实时更新')
+  await finishGeneration(h, 'late obsolete result', 1)
+  assert.equal(h.shell.snap.draft, 'AAA BBB manually revised')
+  assert.equal(h.shell.calls.length, 1)
+  await settleDiff()
+  assert.ok(h.dom.highlights.size > 0)
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  assert.equal(h.confirmations.length, 1)
+  assert.equal(h.streams.length, 3)
+  assert.equal(JSON.parse(h.streams[2].options.body).text, originalDraft)
+  await finishGeneration(h, 'AAA BEST CCC')
+  assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
+  h.button('撤销优化').props.onClick()
+  assert.equal(h.shell.snap.draft, originalDraft)
+})
+
+test('stopped regeneration preserves the previous result and highlights', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  const ranges = highlightedRanges(h)
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  h.streams[1].event('delta', { text: 'partial only' })
+  await flushSse()
+  h.button('停止生成').props.onClick()
+  assert.equal(h.streams[1].options.signal.aborted, true)
+  assert.equal(h.shell.snap.draft, 'AAA BETTER CCC')
+  assert.deepEqual(highlightedRanges(h), ranges)
+  assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
+  await finishGeneration(h, 'late stopped result', 1)
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.confirmations.length, 0)
+})
+
+test('selection editing outside the optimized range conservatively invalidates without confirmation', async t => {
+  const h = sseHarness({ withEditor: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'BETTER')
+  manualEdit(h, 'edited prefix BETTER CCC')
+  assert.equal(h.dom.highlights.size, 0)
+  assert.equal(h.button('撤销优化').props.disabled, true)
+  assert.equal(h.button('重新生成').props.disabled, true)
+  assert.equal(h.status().props['aria-label'], '优化范围已变化，已停止写入')
+  assert.deepEqual(h.overlay().children.find(node => node?.props?.role === 'alert').children, [selectionError])
+  await settleDiff()
+  assert.equal(h.dom.highlights.size, 0)
+  // 即使直接调用禁用按钮的处理器，也不能覆盖修改或再启动请求。
+  h.button('撤销优化').props.onClick()
+  h.button('重新生成').props.onClick()
+  await flushSse()
+  assert.equal(h.shell.snap.draft, 'edited prefix BETTER CCC')
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.streams.length, 1)
+  assert.equal(h.confirmations.length, 0)
+})
+
+test('selection manual edit immediately aborts generation, removes highlights and disables unsafe undo', async () => {
   const h = sseHarness({ withEditor: true })
   await flushSse()
   h.streams[0].event('done', { text: 'BETTER' })
@@ -934,7 +1568,7 @@ test('manual edit immediately aborts generation, removes highlights and disables
   assert.equal(h.button('撤销优化').props.disabled, true)
   assert.equal(h.button('重新生成').props.disabled, true)
   const alert = h.overlay().children.find(node => node?.props?.role === 'alert')
-  assert.deepEqual(alert.children, ['草稿已被编辑或提交，已停止优化；请完成后重新开始。'])
+  assert.deepEqual(alert.children, [selectionError])
   assert.equal(alert.props.style.font, 'inherit')
   assert.equal(alert.props.style.fontSize, 13)
   assert.equal(alert.props.style.fontWeight, 500)
@@ -945,4 +1579,41 @@ test('manual edit immediately aborts generation, removes highlights and disables
   assert.equal(h.shell.calls.length, 1)
   h.button('完成').props.onClick()
   assert.equal(h.listeners.size, 0)
+})
+
+test('operation strip exposes only supported refinement controls', async t => {
+  const h = sseHarness({ withEditor: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  await finishGeneration(h, 'AAA BETTER CCC')
+  for (const label of ['历史', '差异', '接受全部', '拒绝全部', '切换到版本 1']) assert.equal(h.button(label), null)
+  manualEdit(h, 'AAA BETTER and edited CCC')
+  await settleDiff()
+  assert.equal(h.shell.calls.length, 1)
+  assert.ok(h.dom.highlights.size > 0)
+  assert.ok(h.button('原文'))
+  assert.ok(h.button('重新生成'))
+  assert.ok(h.button('撤销优化'))
+})
+
+test('synchronous disposal inside generation insertion cannot recreate the panel', async t => {
+  const h = sseHarness({ withEditor: true, withEditorEvents: true, whole: true })
+  t.after(() => h.dispose())
+  await flushSse()
+  const insert = h.shell.actions.insertText
+  h.shell.actions.insertText = (value, span) => {
+    const result = insert(value, span)
+    h.dispose()
+    return result
+  }
+  await finishGeneration(h, 'AAA GENERATED CCC')
+  assert.equal(h.shell.calls.length, 1)
+  assert.equal(h.shell.snap.draft, 'AAA GENERATED CCC')
+  assert.equal(h.overlay(), null)
+  assert.equal(h.listeners.size, 0)
+  assert.equal(h.sessionListeners.size, 0)
+  assert.equal(h.dom.rootListeners.size, 0)
+  assert.equal(h.dom.highlights.size, 0)
+  await settleDiff()
+  assert.equal(h.overlay(), null)
 })

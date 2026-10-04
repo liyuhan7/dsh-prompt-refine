@@ -21,7 +21,7 @@
   "files": ["lib", "scripts/build-client.js", "cordis.patch.yml", "README.md", "CHANGELOG.md", "LICENSE", "docs/error-messages.md"],
   "scripts": {
     "test": "node --test --experimental-test-isolation=none test/*.test.js",
-    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/highlight-core.js && npm test",
+    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/highlight-core.js && node --check lib/refinement-session.js && npm test",
     "build": "node scripts/build-client.js",
     "build:check": "node scripts/build-client.js --check",
     "pretest": "npm run build && node --check lib/client.bundle.js",

@@ -106,6 +106,7 @@ lib/
 ├── strategy.js
 ├── prompt-validator.js
 ├── highlight-core.js
+├── refinement-session.js
 └── protocol.js
 
 scripts/
