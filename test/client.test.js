@@ -351,10 +351,10 @@ function deferredSse() {
 
 /** 通过公开按钮启动，渲染真实注册的操作浮层。 */
 function sseHarness({ withEditor = false, withEditorEvents = false, whole = false, autostart = true,
-  confirm = () => true } = {}) {
+  initialDraft, selectedSpan, confirm = () => true } = {}) {
   const streams = []
   const confirmations = []
-  const shell = fakeShell({ occurrences: [], attachmentIds: [] })
+  const shell = fakeShell({ occurrences: [], attachmentIds: [], ...(initialDraft === undefined ? {} : { draft: initialDraft }) })
   const listeners = new Set()
   shell.state.subscribe = fn => { listeners.add(fn); return () => listeners.delete(fn) }
   const publish = () => { for (const fn of [...listeners]) fn() }
@@ -427,7 +427,7 @@ function sseHarness({ withEditor = false, withEditorEvents = false, whole = fals
     }
     dom = { root, text, highlights, doc, ...initialEvents, rootListeners, replaceRoot }
   }
-  shell.actions.captureInsertion = () => ({ start: whole ? 0 : 4, end: whole ? 0 : 7, draftRev: shell.snap.draftRev })
+  shell.actions.captureInsertion = () => ({ start: whole ? 0 : 4, end: whole ? 0 : 7, ...selectedSpan, draftRev: shell.snap.draftRev })
   shell.notify = (_level, message) => { throw Error(`unexpected notification: ${message}`) }
   const layoutEffects = []
   const React = {
@@ -666,10 +666,11 @@ test('browser entry highlights only the rewritten text after its single confirme
   assert.equal(h.dom.text.data, h.shell.snap.draft)
   assert.equal(h.dom.highlights.size, 1)
   const [range] = [...h.dom.highlights.values()][0].ranges
-  assert.deepEqual([range.start[1], range.end[1]], [5, 10])
-  const redStyle = h.dom.doc.styles.map(style => style.textContent).find(css => css.includes('-del) {'))
-  assert.match(redStyle, /rgba\(224, 82, 74, 0\.16\)/)
-  assert.match(redStyle, /underline dashed #E0524A/)
+  assert.deepEqual([range.start[1], range.end[1]], [4, 10])
+  const replacementStyle = h.dom.doc.styles.map(style => style.textContent).find(css => css.includes('-del) {'))
+  assert.match(replacementStyle, /rgba\(59, 130, 246, 0\.16\)/)
+  assert.match(replacementStyle, /underline dashed #3B82F6/)
+  assert.doesNotMatch(replacementStyle, /224, 82, 74|E0524A|line-through|\bred\b/i)
   assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')
   assert.deepEqual(h.status().children[0].children, ['已优化'])
   assert.equal(h.status().children[0].props.style.background, '#E7F4EC')
@@ -685,13 +686,13 @@ test('browser entry highlights only the rewritten text after its single confirme
 test('browser entry paints a pure insertion green without a red layer', async () => {
   const h = sseHarness({ withEditor: true })
   await flushSse()
-  h.streams[0].event('done', { text: 'BBBsure' })
+  h.streams[0].event('done', { text: 'BBB sure' })
   h.streams[0].end()
   await flushSse()
-  assert.equal(h.shell.snap.draft, 'AAA BBBsure CCC')
+  assert.equal(h.shell.snap.draft, 'AAA BBB sure CCC')
   assert.equal(h.dom.highlights.size, 1)
   const [range] = [...h.dom.highlights.values()][0].ranges
-  assert.deepEqual([range.start[1], range.end[1]], [7, 11])
+  assert.deepEqual([range.start[1], range.end[1]], [8, 12])
   const wordStyle = h.dom.doc.styles.map(style => style.textContent).find(css => /::highlight\(dsh-prompt-refine-[^)]+\) \{/.test(css) && !css.includes('-del)'))
   assert.match(wordStyle, /rgba\(61, 214, 140, 0\.16\)/)
   assert.match(wordStyle, /underline dashed #3DD68C/)
@@ -773,7 +774,7 @@ test('regeneration replaces its prior result and preserves the old highlight bef
   await flushSse()
   assert.equal(h.shell.snap.draft, 'AAA BEST CCC')
   const [range] = [...h.dom.highlights.values()][0].ranges
-  assert.deepEqual([range.start[1], range.end[1]], [5, 8])
+  assert.deepEqual([range.start[1], range.end[1]], [4, 8])
   h.button('撤销优化').props.onClick()
   assert.equal(h.shell.snap.draft, 'AAA BBB CCC')
   assert.equal(h.dom.highlights.size, 0)
@@ -1055,7 +1056,7 @@ test('whole DOM-only remapping rebuilds highlight ranges on the replacement text
   assert.equal(ranges.length, 1)
   assert.equal(ranges[0].start[0], replacement)
   assert.equal(ranges[0].end[0], replacement)
-  assert.deepEqual([ranges[0].start[1], ranges[0].end[1]], [5, 10])
+  assert.deepEqual([ranges[0].start[1], ranges[0].end[1]], [4, 10])
   assert.equal(h.shell.calls.length, 1)
   assert.equal(h.confirmations.length, 0)
   assert.equal(h.status().props['aria-label'], '已优化 · 改动已标出')

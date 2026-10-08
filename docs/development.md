@@ -49,7 +49,7 @@ dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine
 固定 Release Tag：
 
 ```bash
-dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine#v0.1.1
+dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine#v0.1.3
 ```
 
 安装或升级后重新启动：
@@ -83,8 +83,8 @@ npm run build:check
 示例：
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ## Continuous Integration

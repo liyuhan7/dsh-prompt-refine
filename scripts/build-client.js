@@ -12,7 +12,7 @@ export function buildClientBundle() {
   const license = readFileSync(new URL('./LICENSE', diffPackageUrl), 'utf8')
   // 将 jsdiff 浏览器构建、差异适配器和客户端源码组装为 DSH 的延迟加载模块。
   const core = readFileSync(new URL('../lib/highlight-core.js', import.meta.url), 'utf8')
-    .replace("import { diffArrays, diffChars } from 'diff'", 'const { diffArrays, diffChars } = diffLibrary')
+    .replace("import { diffArrays } from 'diff'", 'const { diffArrays } = diffLibrary')
     .replace(/^export /gm, '')
   const session = readFileSync(new URL('../lib/refinement-session.js', import.meta.url), 'utf8')
     .replace(/^export /gm, '')
@@ -31,7 +31,7 @@ ${vendor}
   })()
   const diffEngine = (() => {
 ${core}
-    return { computeTextDiff, classifyDiffMagnitude, diffSegments, segmentsToHunks, diffHunks, diffRanges }
+    return { computeTextDiff, classifyDiffMagnitude, diffSegments, segmentsToHunks, diffHunks, diffRanges, introducedListItems }
   })()
 ${session}
 ${client}

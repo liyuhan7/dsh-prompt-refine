@@ -37,7 +37,7 @@ dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine
 可从固定版本安装：
 
 ```bash
-dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine#v0.1.1
+dsh plugin --profile web add github:liyuhan7/dsh-prompt-refine#v0.1.3
 ```
 
 安装或升级后重新启动 DSH Web：

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import * as expansion from './fixtures/prompt-expansion.js'
+import { introducedListItems } from '../lib/highlight-core.js'
 
 // 使用实际分发的浏览器模块测试高亮渲染。
 const source = readFileSync(new URL('../lib/client.bundle.js', import.meta.url), 'utf8')
@@ -13,6 +14,45 @@ const context = vm.createContext({
 vm.runInContext(source, context)
 const make = options => client.createHighlightCore(options)
 const native = (value) => JSON.parse(JSON.stringify(value))
+
+// Isolate rendering from diff discovery by injecting the source module's import in a VM.
+// The production module exposes no test-only option or dependency hook.
+function sourceCore(diffEngine, options = {}) {
+  const renderer = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+    .replace("import * as diffEngine from './highlight-core.js'", '')
+    .replace("import { RefinementSession } from './refinement-session.js'", '')
+  let loaded
+  vm.runInNewContext(renderer, {
+    diffEngine: { introducedListItems, ...diffEngine },
+    window: { __ModuleLoader__: { load: ({ factory }) => { loaded = factory(() => ({})) } } }
+  }, { filename: 'client.source.js' })
+  return loaded.createHighlightCore(options)
+}
+
+// Verify ordered, bounded hunks encode the claimed edit, including equal gaps.
+function stubWalk(original, result, hunks) {
+  let oldAt = 0
+  let newAt = 0
+  for (const hunk of hunks) {
+    const addAt = hunk.add?.start ?? hunk.resultAnchor
+    const equalLength = addAt - newAt
+    assert.ok(equalLength >= 0)
+    assert.equal(original.slice(oldAt, oldAt + equalLength), result.slice(newAt, addAt))
+    oldAt += equalLength
+    newAt = addAt
+    if (hunk.rem) {
+      assert.equal(hunk.rem.start, oldAt)
+      assert.ok(hunk.rem.end > oldAt && hunk.rem.end <= original.length)
+      oldAt = hunk.rem.end
+    }
+    if (hunk.add) {
+      assert.ok(hunk.add.end > newAt && hunk.add.end <= result.length)
+      newAt = hunk.add.end
+    }
+  }
+  assert.equal(original.slice(oldAt), result.slice(newAt))
+  return { hunks, reason: null }
+}
 
 function dom(draft, chips = [], opts = {}) {
   function element(tag, attributes = {}, ...children) {
@@ -78,6 +118,71 @@ test('diff returns bounded UTF-16 changed spans without splitting emoji', () => 
   assert.deepEqual(native(core.diffRanges('abc', 'ac')), { ranges: [], reason: 'no-visible-addition' })
   assert.deepEqual(native(core.diffRanges('a'.repeat(1000), 'b'.repeat(1000))), { ranges: [{ start: 0, end: 1000 }], reason: null })
   assert.deepEqual(native(make({ maxLength: 2 }).diffRanges('aaa', 'bbb')), { ranges: [{ start: 0, end: 3 }], reason: null })
+})
+
+const add = (start, end, rem = null) => ({ add: { start, end }, rem })
+const deletion = (start, end, resultAnchor) => ({ add: null, rem: { start, end }, resultAnchor })
+
+for (const [label, original, result, color, hunks] of [
+  ['single retained letter', 'a', 'XaY', 'green', [add(0, 1), add(2, 3)]],
+  ['retained letters with deletion', 'acb', 'XabY', 'green', [add(0, 1), deletion(1, 2, 2), add(3, 4)]],
+  ['two replacements around retained letters', 'pabq', 'XabY', 'red', [add(0, 1, { start: 0, end: 1 }), add(3, 4, { start: 3, end: 4 })]],
+  ['two replacements with deletion', 'pacbq', 'XabY', 'red', [add(0, 1, { start: 0, end: 1 }), deletion(2, 3, 2), add(3, 4, { start: 4, end: 5 })]],
+  ['retained punctuation', ';;;', 'X;;;Y', 'green', [add(0, 1), add(4, 5)]],
+  ['retained emoji', 'p🙂🙂q', 'X🙂🙂Y', 'red', [add(0, 1, { start: 0, end: 1 }), add(5, 6, { start: 5, end: 6 })]]
+]) {
+  for (const currentMode of [false, true]) test(`isolated renderer keeps ${label} unpainted (${currentMode ? 'current' : 'write'} mode)`, () => {
+    const walk = stubWalk(original, result, hunks)
+    const core = sourceCore({ diffHunks: (old, next) => {
+      assert.equal(old, original)
+      assert.equal(next, result)
+      return walk
+    } }, { name: 'isolated' })
+    const { root, doc, highlights } = dom(result)
+    const nodes = root.childNodes[0].childNodes
+    const text = nodes[0].childNodes[0]
+    const before = snapshot(original)
+    const after = snapshot(result, [], 2)
+    const saved = structuredClone({ before, after, walk })
+    const shown = core.show({ root, before, snapshot: after, original, result, start: 0, currentMode })
+    const key = color === 'green' ? 'isolated' : 'isolated-del'
+    const opposite = color === 'green' ? 'isolated-del' : 'isolated'
+    assert.equal(shown.kind, 'highlighted')
+    assert.equal(shown.count, color === 'green' ? 2 : 0)
+    assert.equal(shown.replaced, color === 'red' ? 2 : 0)
+    assert.equal(shown.coverage, 2 / result.length)
+    assert.deepEqual(highlights.get(key).ranges.map(r => [r.start[1], r.end[1]]), [[0, 1], [result.length - 1, result.length]])
+    assert.equal(highlights.has(opposite), false)
+    assert.equal(highlights.size, 1)
+    assert.equal(doc.styles.length, 1)
+    for (const range of highlights.get(key).ranges) {
+      assert.equal(range.start[0], text)
+      assert.equal(range.end[0], text)
+    }
+    assert.equal(root.childNodes[0].childNodes, nodes)
+    assert.equal(nodes[0].childNodes[0], text)
+    assert.equal(text.data, result)
+    assert.deepEqual({ before, after, walk }, saved)
+  })
+}
+
+for (const [original, color, hunks] of [
+  ['cb', 'green', [add(0, 1), deletion(0, 1, 1), add(1, 2)]],
+  ['pcqb', 'red', [add(0, 1, { start: 0, end: 1 }), deletion(1, 2, 1), add(1, 2, { start: 2, end: 3 })]]
+]) test(`deletion-only hunk breaks even touching ${color} groups without creating a range`, () => {
+  const result = 'XYb'
+  const walk = stubWalk(original, result, hunks)
+  const core = sourceCore({ diffHunks: () => walk }, { name: 'barrier' })
+  const { root, highlights } = dom(result)
+  const shown = core.show({ root, snapshot: snapshot(result), original, result, start: 0, currentMode: true })
+  assert.equal(shown.kind, 'highlighted')
+  const key = color === 'green' ? 'barrier' : 'barrier-del'
+  assert.deepEqual(highlights.get(key).ranges.map(r => [r.start[1], r.end[1]]), [[0, 1], [1, 2]])
+  assert.equal(shown.count, color === 'green' ? 2 : 0)
+  assert.equal(shown.replaced, color === 'red' ? 2 : 0)
+  assert.equal(shown.coverage, 2 / result.length)
+  assert.equal(highlights.size, 1)
+  assert.equal(root.childNodes[0].childNodes[0].childNodes[0].data, result)
 })
 
 test('show maps inserted changes to text nodes, without mutating editor or caret', () => {
@@ -187,7 +292,24 @@ test('pure deletion has no renderable result span', () => {
   assert.equal(root.childNodes[0].childNodes[0].childNodes[0].data, 'ac')
 })
 
-test('replacement marks only actual result text red', () => {
+for (const currentMode of [false, true]) {
+  test(`replacement uses blue styling without deletion decoration (${currentMode ? 'current' : 'write'})`, () => {
+    const core = make({ name: 'blue-style' })
+    const { root, doc, highlights } = dom('AXB')
+    const shown = core.show({ root, before: snapshot('A🙂B'), snapshot: snapshot('AXB', [], 2),
+      original: 'A🙂B', result: 'AXB', start: 0, currentMode })
+    assert.equal(shown.replaced, 1)
+    assert.deepEqual(highlights.get('blue-style-del').ranges.map(r => [r.start[1], r.end[1]]), [[1, 2]])
+    const css = doc.styles.map(style => style.textContent).join('\n')
+    assert.match(css, /background-color: rgba\(59, 130, 246, 0\.16\)/)
+    assert.match(css, /text-decoration: underline dashed #3B82F6/)
+    assert.match(css, /color: inherit/)
+    assert.doesNotMatch(css, /224, 82, 74|E0524A|line-through|\bred\b/i)
+    assert.equal(root.childNodes[0].childNodes[0].childNodes[0].data, 'AXB')
+  })
+}
+
+test('replacement marks only actual result text blue', () => {
   const core = make({ name: 'replace-red' })
   const { root, highlights } = dom('AXB')
   const shown = core.show({ root, before: snapshot('A🙂B'), snapshot: snapshot('AXB', [], 2),
@@ -233,22 +355,22 @@ test('browser highlighting leaves the retained sentence unpainted in an expanded
 
 test('green insertions and red replacements stay in separate non-overlapping layers', () => {
   const core = make({ name: 'mixed-colors' })
-  const { root, highlights } = dom('aXcq')
-  const out = core.show({ root, before: snapshot('abc'), snapshot: snapshot('aXcq', [], 2),
-    original: 'abc', result: 'aXcq', start: 0 })
+  const { root, highlights } = dom('aXc q')
+  const out = core.show({ root, before: snapshot('abc '), snapshot: snapshot('aXc q', [], 2),
+    original: 'abc ', result: 'aXc q', start: 0 })
   assert.equal(out.kind, 'highlighted')
   assert.equal(out.count, 1)
   assert.equal(out.replaced, 1)
   assert.deepEqual(highlights.get('mixed-colors-del').ranges.map(r => [r.start[1], r.end[1]]), [[1, 2]])
-  assert.deepEqual(highlights.get('mixed-colors').ranges.map(r => [r.start[1], r.end[1]]), [[3, 4]])
+  assert.deepEqual(highlights.get('mixed-colors').ranges.map(r => [r.start[1], r.end[1]]), [[4, 5]])
 })
 
 test('clear tears down every painted layer, not just the last one', () => {
   const core = make({ name: 'all-layers' })
   // 仅标记首行的替换和新增文字，保留文字及第二行不着色。
-  const { root, doc, highlights } = dom('aXcqq\nkeep')
-  const out = core.show({ root, before: snapshot('abc\nkeep'), snapshot: snapshot('aXcqq\nkeep', [], 2),
-    original: 'abc\nkeep', result: 'aXcqq\nkeep', start: 0 })
+  const { root, doc, highlights } = dom('aXc qq\nkeep')
+  const out = core.show({ root, before: snapshot('abc \nkeep'), snapshot: snapshot('aXc qq\nkeep', [], 2),
+    original: 'abc \nkeep', result: 'aXc qq\nkeep', start: 0 })
   assert.equal(out.kind, 'highlighted')
   assert.equal(out.replaced, 1)
   assert.equal(highlights.size, 2)
@@ -309,13 +431,43 @@ test('check parses matching snapshot layout once and preserves stale revision cl
   assert.equal(highlights.size, 0)
 })
 
-test('coalesceRanges folds adjacent additions into readable spans', () => {
+test('coalesceRanges never covers positive gaps, including letters, punctuation, whitespace and emoji', () => {
+  for (const gap of ['a', 'ab', ';;;', ' ', '\t', '\n', '🙂🙂']) {
+    const text = `X${gap}Y`
+    const ranges = [{ start: 0, end: 1 }, { start: text.length - 1, end: text.length }]
+    for (const core of [make(), make({ mergeGap: 100 })]) {
+      assert.deepEqual(native(core.coalesceRanges(ranges, text)), ranges, `default gap: ${JSON.stringify(gap)}`)
+      assert.deepEqual(native(core.coalesceRanges(ranges, text, 100)), ranges, `explicit gap: ${JSON.stringify(gap)}`)
+    }
+    assert.deepEqual(ranges, [{ start: 0, end: 1 }, { start: text.length - 1, end: text.length }])
+  }
   const core = make()
   const text = 'alpha：beta；gamma delta'
   assert.deepEqual(native(core.coalesceRanges([{ start: 0, end: 5 }, { start: 6, end: 10 }, { start: 11, end: 16 }], text)),
-    [{ start: 0, end: 16 }])
-  assert.deepEqual(native(core.coalesceRanges([{ start: 0, end: 5 }, { start: 6, end: 7 }], text)), [{ start: 0, end: 7 }])
-  assert.deepEqual(native(core.coalesceRanges([{ start: 16, end: 17 }], text)), [])
+    [{ start: 0, end: 5 }, { start: 6, end: 10 }, { start: 11, end: 16 }])
+  assert.deepEqual(native(core.coalesceRanges([{ start: 0, end: 5 }, { start: 6, end: 7 }], text)),
+    [{ start: 0, end: 5 }, { start: 6, end: 7 }])
+})
+
+test('coalesceRanges merges touching and overlapping intervals without mutating input', () => {
+  const core = make()
+  for (const ranges of [
+    [{ start: 0, end: 2 }, { start: 2, end: 4 }, { start: 4, end: 6 }],
+    [{ start: 0, end: 3 }, { start: 2, end: 5 }, { start: 4, end: 6 }],
+    [{ start: 0, end: 6 }, { start: 1, end: 2 }]
+  ]) {
+    const before = structuredClone(ranges)
+    assert.deepEqual(native(core.coalesceRanges(ranges, 'abcdef', -1)), [{ start: 0, end: 6 }])
+    assert.deepEqual(ranges, before)
+  }
+})
+
+test('coalesceRanges retains whitespace edge trimming and empty-range filtering', () => {
+  const core = make()
+  assert.deepEqual(native(core.coalesceRanges([{ start: 0, end: 7 }], ' \tfoo\n ')), [{ start: 2, end: 5 }])
+  assert.deepEqual(native(core.coalesceRanges([{ start: 0, end: 3 }], ' \t\n')), [])
+  assert.deepEqual(native(core.coalesceRanges([{ start: 1, end: 1 }], 'abc')), [])
+  assert.deepEqual(native(core.coalesceRanges([], 'abc')), [])
   // 段落分隔符不应进入高亮范围。
   assert.deepEqual(native(core.coalesceRanges([{ start: 3, end: 8 }], 'abc\ndefg')), [{ start: 4, end: 8 }])
 })
@@ -441,6 +593,41 @@ test('current-model scope must not cover reference chips', () => {
     original: 'hello', result: 'hi', start: 2, currentMode: true }).kind, 'highlighted')
 })
 
+test('unrelated multiline substitution keeps red despite introduced lists later', () => {
+  const original = '甲乙\n丙丁。保留。执行。'
+  const result = '戊己庚辛。保留。\n- **一**：执行。\n- **二**：补充。'
+  const setup = dom(result)
+  const core = make({ name: 'intro-red' })
+  assert.equal(core.show({ root: setup.root, snapshot: snapshot(result), original, result, start: 0, currentMode: true }).kind, 'highlighted')
+  assert.ok(fixtureLayerRanges(setup, 'intro-red-del').some(([start, end]) => start === 0 && end === 4))
+})
+
+test('existing labelled list heading substitutions still use red replacement coloring', () => {
+  const original = '- **涉及范围**：修改文件。\n- **测试**：执行测试。'
+  const result = '- **修改范围**：修改文件。\n- **测试**：执行测试。'
+  const core = make({ name: 'existing-list' })
+  const setup = dom(result)
+  assert.equal(core.show({ root: setup.root, snapshot: snapshot(result), original, result, start: 0, currentMode: true }).kind, 'highlighted')
+  assert.deepEqual(fixtureLayerRanges(setup, 'existing-list-del'), [[4, 6]])
+  assert.deepEqual(fixtureLayerRanges(setup, 'existing-list'), [])
+})
+
+function fixtureLayerRanges(setup, key) {
+  const offsets = new Map()
+  let at = 0
+  for (const paragraph of setup.para) {
+    const visit = node => {
+      if (node.nodeType === 3) { offsets.set(node, at); at += node.data.length }
+      else for (const child of node.childNodes) visit(child)
+    }
+    visit(paragraph)
+    at++
+  }
+  return (setup.highlights.get(key)?.ranges ?? []).map(range => [
+    offsets.get(range.start[0]) + range.start[1], offsets.get(range.end[0]) + range.end[1]
+  ])
+}
+
 test('coverage is measured against the whole draft, not the replaced text', () => {
   const core = make({ name: 'coverage' })
   // 选区完全改写仍可能是局部修改；高亮比例以整个草稿为分母。
@@ -448,5 +635,5 @@ test('coverage is measured against the whole draft, not the replaced text', () =
   const out = core.show({ root, before: snapshot('AAA BBB CCC'), snapshot: snapshot('AAA BETTER CCC', [], 2),
     original: 'BBB', replaced: 'BBB', result: 'BETTER', start: 4 })
   assert.equal(out.kind, 'highlighted')
-  assert.equal(Math.round(out.coverage * 100), 36)
+  assert.equal(Math.round(out.coverage * 100), 43)
 })
